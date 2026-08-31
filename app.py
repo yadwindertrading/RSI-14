@@ -1,45 +1,72 @@
 import time
 import requests
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------- CONFIGURATION ----------------- #
-# CoinDCX Pair: "B-BTC_USDT", "B-ETH_USDT", or "I-BTC_INR"
-COINDCX_PAIR = "B-BTC_USDT"
 INTERVAL = "1h"
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 80
-RSI_OVERSOLD = 20
+
+# Alert Thresholds
+RSI_STANDARD_OB = 80.0
+RSI_EXTREME_OB = 85.0
+
+RSI_STANDARD_OS = 20.0
+RSI_EXTREME_OS = 15.0
+
+COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown for standard alerts
+CYCLE_INTERVAL_SECONDS = 60  # Scan exchange every 1 minute
+MAX_WORKERS = 15            # Concurrent worker threads
 
 # Telegram Bot Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
 TELEGRAM_CHAT_ID = "7203290966"
-
-# Check frequency in seconds (every 5 minutes)
-CHECK_INTERVAL_SECONDS = 300
 # ------------------------------------------------- #
 
-last_alerted_candle_time = None
+# State tracker per pair:
+# { pair: {"last_alert_time": float, "last_tier": "STANDARD_OB" | "EXTREME_OB" | "STANDARD_OS" | "EXTREME_OS" | None} }
+tracker = {}
+
+
+def get_all_usdt_pairs():
+    """Fetches all active USDT trading pairs dynamically from CoinDCX."""
+    url = "https://api.coindcx.com/exchange/v1/markets_details"
+    try:
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        
+        pairs = []
+        for item in data:
+            if item.get("status") == "active":
+                pair_symbol = item.get("pair")
+                base_curr = item.get("base_currency_short_name")
+                
+                # Only include USDT-based pairs
+                if base_curr == "USDT" and pair_symbol:
+                    pairs.append(pair_symbol)
+                    
+        print(f"Loaded {len(pairs)} active USDT pairs from CoinDCX.")
+        return sorted(pairs)
+    except Exception as e:
+        print(f"Error fetching market list: {e}")
+        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Calculates exact Wilder's Smoothed RSI (identical to TradingView / CoinDCX).
-    """
+    """Calculates exact Wilder's Smoothed RSI."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
 
-    # Wilder's exponential smoothing alpha = 1 / period
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 
 def send_telegram_alert(message: str):
-    """Sends a markdown-formatted message to your Telegram."""
+    """Sends a markdown-formatted message to Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -54,76 +81,128 @@ def send_telegram_alert(message: str):
         print(f"Failed to reach Telegram API: {e}")
 
 
-def fetch_and_evaluate():
-    global last_alerted_candle_time
+def evaluate_pair(pair: str):
+    global tracker
+    now = time.time()
 
-    # Fetch 300 historical candles so the RSI EMA smoothing matches TradingView precisely
-    url = f"https://public.coindcx.com/market_data/candles/?pair={COINDCX_PAIR}&interval={INTERVAL}&limit=300"
+    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
 
     try:
         response = requests.get(url, timeout=10)
         data = response.json()
 
         if not isinstance(data, list) or len(data) < RSI_PERIOD + 2:
-            print("CoinDCX API returned insufficient or invalid candle data.")
             return
 
-        # Sort candles oldest to newest
         df = pd.DataFrame(data)
         df = df.sort_values(by="time", ascending=True).reset_index(drop=True)
         df["close"] = df["close"].astype(float)
 
-        # Compute RSI across the full history
+        # Calculate RSI across all candles
         df["rsi"] = calculate_rsi(df["close"], period=RSI_PERIOD)
 
-        # Index -2 is the most recently CLOSED candle; Index -1 is the actively fluctuating candle
-        latest_closed_candle = df.iloc[-2]
-        current_candle_time = latest_closed_candle["time"]
-        current_rsi = latest_closed_candle["rsi"]
-        close_price = latest_closed_candle["close"]
+        # Index -1 is the RUNNING / LIVE 1-hour candle
+        live_candle = df.iloc[-1]
+        current_rsi = live_candle["rsi"]
+        live_price = live_candle["close"]
 
-        print(
-            f"[{COINDCX_PAIR}] Time: {current_candle_time} | "
-            f"Closed 1h RSI: {current_rsi:.2f} | Close Price: {close_price}"
-        )
+        # Initialize tracker state if first encounter
+        if pair not in tracker:
+            tracker[pair] = {"last_alert_time": 0, "last_tier": None}
 
-        # Prevent duplicate alert triggers for the same candle
-        if last_alerted_candle_time == current_candle_time:
+        state = tracker[pair]
+        time_since_alert = now - state["last_alert_time"]
+
+        # ----------------- RESET LOGIC ----------------- #
+        if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
+            # RSI normalized inside 20 - 80, reset alert tier
+            state["last_tier"] = None
             return
 
-        if current_rsi >= RSI_OVERBOUGHT:
-            msg = (
-                f"🚨 *RSI OVERBOUGHT ALERT (CoinDCX)*\n\n"
-                f"*Pair:* `{COINDCX_PAIR}`\n"
-                f"*Timeframe:* 1 Hour\n"
-                f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_OVERBOUGHT})\n"
-                f"*Close Price:* `{close_price}`"
-            )
-            send_telegram_alert(msg)
-            last_alerted_candle_time = current_candle_time
+        # ----------------- OVERBOUGHT LOGIC ----------------- #
+        if current_rsi >= RSI_EXTREME_OB:
+            # Tier: Extreme Overbought (Bypasses 15m cooldown if previous alert was only standard)
+            if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
+                msg = (
+                    f"🔥 *CRITICAL OVERBOUGHT ALERT (CoinDCX)*\n\n"
+                    f"*Pair:* `{pair}`\n"
+                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
+                    f"*Live Price:* `{live_price}`"
+                )
+                send_telegram_alert(msg)
+                state["last_alert_time"] = now
+                state["last_tier"] = "EXTREME_OB"
 
-        elif current_rsi <= RSI_OVERSOLD:
-            msg = (
-                f"🟢 *RSI OVERSOLD ALERT (CoinDCX)*\n\n"
-                f"*Pair:* `{COINDCX_PAIR}`\n"
-                f"*Timeframe:* 1 Hour\n"
-                f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_OVERSOLD})\n"
-                f"*Close Price:* `{close_price}`"
-            )
-            send_telegram_alert(msg)
-            last_alerted_candle_time = current_candle_time
+        elif current_rsi >= RSI_STANDARD_OB:
+            # Tier: Standard Overbought
+            if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
+                msg = (
+                    f"🚨 *RSI OVERBOUGHT ALERT (CoinDCX)*\n\n"
+                    f"*Pair:* `{pair}`\n"
+                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
+                    f"*Live Price:* `{live_price}`"
+                )
+                send_telegram_alert(msg)
+                state["last_alert_time"] = now
+                state["last_tier"] = "STANDARD_OB"
 
-    except Exception as e:
-        print(f"Error during poll cycle: {e}")
+        # ----------------- OVERSOLD LOGIC ----------------- #
+        elif current_rsi <= RSI_EXTREME_OS:
+            # Tier: Extreme Oversold (Bypasses 15m cooldown if previous alert was only standard)
+            if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
+                msg = (
+                    f"❄️ *CRITICAL OVERSOLD ALERT (CoinDCX)*\n\n"
+                    f"*Pair:* `{pair}`\n"
+                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
+                    f"*Live Price:* `{live_price}`"
+                )
+                send_telegram_alert(msg)
+                state["last_alert_time"] = now
+                state["last_tier"] = "EXTREME_OS"
+
+        elif current_rsi <= RSI_STANDARD_OS:
+            # Tier: Standard Oversold
+            if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
+                msg = (
+                    f"🟢 *RSI OVERSOLD ALERT (CoinDCX)*\n\n"
+                    f"*Pair:* `{pair}`\n"
+                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
+                    f"*Live Price:* `{live_price}`"
+                )
+                send_telegram_alert(msg)
+                state["last_alert_time"] = now
+                state["last_tier"] = "STANDARD_OS"
+
+    except Exception:
+        pass
+
+
+def scan_all_markets(pairs):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(evaluate_pair, pair) for pair in pairs]
+        for future in as_completed(futures):
+            pass
 
 
 if __name__ == "__main__":
-    print(f"Starting CoinDCX 1h RSI Alert Engine for {COINDCX_PAIR}...")
+    print("Starting CoinDCX Live 1h RSI Scanner (USDT Pairs)...")
+    all_pairs = get_all_usdt_pairs()
+
     send_telegram_alert(
-        f"🤖 *CoinDCX RSI Bot Active*\n"
-        f"Monitoring `{COINDCX_PAIR}` on the `1h` timeframe."
+        f"🤖 *CoinDCX Scanner Running*\n"
+        f"Scanning `{len(all_pairs)}` USDT pairs every 60s.\n"
+        f"Live 1h candle evaluation with 15m cooldown & 85/15 extreme priority."
     )
 
     while True:
-        fetch_and_evaluate()
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        cycle_start = time.time()
+        scan_all_markets(all_pairs)
+        elapsed = time.time() - cycle_start
+
+        # Maintain 60-second cycle timing
+        sleep_time = max(0, CYCLE_INTERVAL_SECONDS - elapsed)
+        time.sleep(sleep_time)
