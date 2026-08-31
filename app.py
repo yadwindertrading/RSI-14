@@ -29,44 +29,40 @@ RSI_EXTREME_OS = 15.0
 
 COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown
 CYCLE_INTERVAL_SECONDS = 60  # Scan every 1 minute
-MAX_WORKERS = 15
+MAX_WORKERS = 20            # Parallel scanner threads
 
 # Telegram Bot Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
-TELEGRAM_CHAT_IDS = ["7203290966"]  # Add cousin's ID here when available
+TELEGRAM_CHAT_IDS = ["7203290966"]  # Add your cousin's ID here when available
 # ------------------------------------------------- #
 
 tracker = {}
 
 
-def get_all_usdt_pairs():
-    """Fetches all tradeable USDT pairs using their exact API 'pair' key, excluding KuCoin (KC-)."""
-    url = "https://api.coindcx.com/exchange/v1/markets_details"
+def get_all_binance_usdt_pairs():
+    """Fetches all actively trading USDT spot pairs directly from Binance API."""
+    url = "https://api.binance.com/api/v3/exchangeInfo"
     try:
         response = requests.get(url, timeout=15)
         data = response.json()
         pairs = []
-        for item in data:
-            if item.get("status") == "active" and item.get("base_currency_short_name") == "USDT":
-                # Always grab the exact API 'pair' identifier required by the candle API
-                pair_name = item.get("pair")
+        for symbol_info in data.get("symbols", []):
+            if (
+                symbol_info.get("status") == "TRADING"
+                and symbol_info.get("quoteAsset") == "USDT"
+                and symbol_info.get("isSpotTradingAllowed", True)
+            ):
+                pairs.append(symbol_info.get("symbol"))
                 
-                # Exclude unsearchable KuCoin order books
-                if pair_name and pair_name.startswith("KC-"):
-                    continue
-                
-                if pair_name and pair_name not in pairs:
-                    pairs.append(pair_name)
-                    
-        print(f"Loaded {len(pairs)} active USDT pairs from CoinDCX.")
+        print(f"Loaded {len(pairs)} active USDT pairs directly from Binance.")
         return sorted(pairs)
     except Exception as e:
-        print(f"Error fetching market list: {e}")
-        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
+        print(f"Error fetching Binance market list: {e}")
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates exact Wilder's Smoothed RSI."""
+    """Calculates exact Wilder's Smoothed RSI (identical to TradingView/Binance)."""
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -93,47 +89,39 @@ def send_telegram_alert(message: str):
             print(f"Failed to reach Telegram API for {chat_id}: {e}")
 
 
-def clean_display_symbol(pair: str) -> str:
-    """Formats any token name cleanly into SYMBOL/USDT."""
-    clean = pair.replace("B-", "").replace("I-", "")
-    if clean.endswith("_USDT"):
-        clean = clean.replace("_USDT", "/USDT")
-    elif clean.endswith("USDT") and not clean.endswith("/USDT"):
-        clean = clean[:-4] + "/USDT"
-    return clean
-
-
-def evaluate_pair(pair: str):
+def evaluate_pair(symbol: str):
     global tracker
     now = time.time()
-    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
+
+    # Binance standard 1h klines endpoint (limit=100 is plenty for RSI 14)
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={INTERVAL}&limit=100"
 
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=8)
         data = response.json()
 
         if not isinstance(data, list) or len(data) < RSI_PERIOD + 2:
             return
 
-        df = pd.DataFrame(data)
-        df = df.sort_values(by="time", ascending=True).reset_index(drop=True)
-        df["close"] = df["close"].astype(float)
+        # Binance kline index 4 is the Close price
+        closes = [float(kline[4]) for kline in data]
+        df = pd.DataFrame({"close": closes})
         df["rsi"] = calculate_rsi(df["close"], period=RSI_PERIOD)
 
-        # Live running 1-hour candle
-        live_candle = df.iloc[-1]
-        current_rsi = live_candle["rsi"]
-        live_price = live_candle["close"]
+        # Index -1 represents the actively RUNNING 1-hour candle
+        current_rsi = df["rsi"].iloc[-1]
+        live_price = df["close"].iloc[-1]
 
-        clean_name = clean_display_symbol(pair)
+        # Clean display format (e.g. BTCUSDT -> BTC/USDT)
+        clean_name = f"{symbol[:-4]}/USDT" if symbol.endswith("USDT") else symbol
 
-        if pair not in tracker:
-            tracker[pair] = {"last_alert_time": 0, "last_tier": None}
+        if symbol not in tracker:
+            tracker[symbol] = {"last_alert_time": 0, "last_tier": None}
 
-        state = tracker[pair]
+        state = tracker[symbol]
         time_since_alert = now - state["last_alert_time"]
 
-        # Reset state when RSI returns to neutral zone
+        # Reset alert tier when RSI normalizes between 20 and 80
         if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
             state["last_tier"] = None
             return
@@ -198,17 +186,17 @@ def evaluate_pair(pair: str):
 
 def scan_all_markets(pairs):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(evaluate_pair, pair) for pair in pairs]
+        futures = [executor.submit(evaluate_pair, symbol) for symbol in pairs]
         for future in as_completed(futures):
             pass
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Live 1h RSI Scanner (All Active USDT Pairs)...")
-    all_pairs = get_all_usdt_pairs()
+    print("Starting Live 1h RSI Scanner via Binance Engine...")
+    all_pairs = get_all_binance_usdt_pairs()
 
     send_telegram_alert(
-        f"🤖 *CoinDCX Scanner Active*\n"
+        f"🤖 *Crypto RSI Scanner Online*\n"
         f"Monitoring `{len(all_pairs)}` USDT pairs on 1-hour live candles."
     )
 
