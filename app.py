@@ -28,19 +28,20 @@ RSI_STANDARD_OS = 20.0
 RSI_EXTREME_OS = 15.0
 
 COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown for standard alerts
-CYCLE_INTERVAL_SECONDS = 60  # Scan every 1 minute
-MAX_WORKERS = 15
+CYCLE_INTERVAL_SECONDS = 60  # Scan exchange every 1 minute
+MAX_WORKERS = 15            # Concurrent worker threads
 
 # Telegram Bot Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
-TELEGRAM_CHAT_IDS = ["7203290966"]  # Add your cousin's ID here in quotes when available
+TELEGRAM_CHAT_IDS = ["7203290966"]  # Add your cousin's ID here when available
 # ------------------------------------------------- #
 
+# State tracker: { pair: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
 
-def get_all_usdt_pairs():
-    """Fetches all active USDT trading pairs dynamically from CoinDCX."""
+def get_all_b_usdt_pairs():
+    """Fetches only actively tradeable Binance-backed (B-) USDT pairs from CoinDCX."""
     url = "https://api.coindcx.com/exchange/v1/markets_details"
     try:
         response = requests.get(url, timeout=15)
@@ -50,9 +51,9 @@ def get_all_usdt_pairs():
             for item in data
             if item.get("status") == "active"
             and item.get("base_currency_short_name") == "USDT"
-            and item.get("pair")
+            and item.get("pair", "").startswith("B-")  # Strictly Binance-backed USDT
         ]
-        print(f"Loaded {len(pairs)} active USDT pairs from CoinDCX.")
+        print(f"Loaded {len(pairs)} active Binance (B-) USDT pairs from CoinDCX.")
         return sorted(pairs)
     except Exception as e:
         print(f"Error fetching market list: {e}")
@@ -109,13 +110,16 @@ def evaluate_pair(pair: str):
         current_rsi = live_candle["rsi"]
         live_price = live_candle["close"]
 
+        # Clean display name (e.g. "B-BTC_USDT" -> "BTC/USDT")
+        clean_name = pair.replace("B-", "").replace("_", "/")
+
         if pair not in tracker:
             tracker[pair] = {"last_alert_time": 0, "last_tier": None}
 
         state = tracker[pair]
         time_since_alert = now - state["last_alert_time"]
 
-        # ----------------- RESET LOGIC ----------------- #
+        # Reset state when back in neutral zone
         if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
             state["last_tier"] = None
             return
@@ -124,11 +128,11 @@ def evaluate_pair(pair: str):
         if current_rsi >= RSI_EXTREME_OB:
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🔥 *CRITICAL OVERBOUGHT ALERT (CoinDCX)*\n\n"
-                    f"*Pair:* `{pair}`\n"
-                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"🔥 *CRITICAL OVERBOUGHT ALERT*\n\n"
+                    f"*Pair:* `{clean_name}`\n"
+                    f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
-                    f"*Live Price:* `{live_price}`"
+                    f"*Live Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -137,11 +141,11 @@ def evaluate_pair(pair: str):
         elif current_rsi >= RSI_STANDARD_OB:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🚨 *RSI OVERBOUGHT ALERT (CoinDCX)*\n\n"
-                    f"*Pair:* `{pair}`\n"
-                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"🚨 *RSI OVERBOUGHT ALERT*\n\n"
+                    f"*Pair:* `{clean_name}`\n"
+                    f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
-                    f"*Live Price:* `{live_price}`"
+                    f"*Live Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -151,11 +155,11 @@ def evaluate_pair(pair: str):
         elif current_rsi <= RSI_EXTREME_OS:
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"❄️ *CRITICAL OVERSOLD ALERT (CoinDCX)*\n\n"
-                    f"*Pair:* `{pair}`\n"
-                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"❄️ *CRITICAL OVERSOLD ALERT*\n\n"
+                    f"*Pair:* `{clean_name}`\n"
+                    f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
-                    f"*Live Price:* `{live_price}`"
+                    f"*Live Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -164,11 +168,11 @@ def evaluate_pair(pair: str):
         elif current_rsi <= RSI_STANDARD_OS:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🟢 *RSI OVERSOLD ALERT (CoinDCX)*\n\n"
-                    f"*Pair:* `{pair}`\n"
-                    f"*Timeframe:* 1 Hour (Running Bar)\n"
+                    f"🟢 *RSI OVERSOLD ALERT*\n\n"
+                    f"*Pair:* `{clean_name}`\n"
+                    f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
-                    f"*Live Price:* `{live_price}`"
+                    f"*Live Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -186,13 +190,12 @@ def scan_all_markets(pairs):
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Live 1h RSI Scanner (USDT Pairs)...")
-    all_pairs = get_all_usdt_pairs()
+    print("Starting CoinDCX Live 1h RSI Scanner (Binance USDT Pairs)...")
+    all_pairs = get_all_b_usdt_pairs()
 
     send_telegram_alert(
-        f"🤖 *CoinDCX Scanner Running*\n"
-        f"Scanning `{len(all_pairs)}` USDT pairs every 60s.\n"
-        f"Live 1h candle evaluation with 15m cooldown & 85/15 extreme priority."
+        f"🤖 *CoinDCX Scanner Active*\n"
+        f"Monitoring `{len(all_pairs)}` Binance USDT pairs on 1-hour timeframe."
     )
 
     while True:
