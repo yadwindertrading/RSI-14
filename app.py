@@ -27,24 +27,20 @@ RSI_EXTREME_OB = 85.0
 RSI_STANDARD_OS = 20.0
 RSI_EXTREME_OS = 15.0
 
-COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown for standard alerts
-CYCLE_INTERVAL_SECONDS = 60  # Scan exchange every 1 minute
-MAX_WORKERS = 15            # Concurrent worker threads
+COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown
+CYCLE_INTERVAL_SECONDS = 60  # Scan every 1 minute
+MAX_WORKERS = 15
 
 # Telegram Bot Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
-TELEGRAM_CHAT_IDS = ["7203290966"]  # Add your cousin's ID here in quotes when available
+TELEGRAM_CHAT_IDS = ["7203290966"]  # Add your cousin's ID here when available
 # ------------------------------------------------- #
 
-# State tracker: { pair: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
 
 def get_all_usdt_pairs():
-    """
-    Fetches all tradeable USDT pairs (Binance-backed, native CoinDCX listings, and unprefixed pairs)
-    while excluding unsearchable KuCoin (KC-) listings.
-    """
+    """Fetches all tradeable USDT pairs across all formats, excluding KuCoin (KC-)."""
     url = "https://api.coindcx.com/exchange/v1/markets_details"
     try:
         response = requests.get(url, timeout=15)
@@ -52,6 +48,7 @@ def get_all_usdt_pairs():
         pairs = []
         for item in data:
             if item.get("status") == "active" and item.get("base_currency_short_name") == "USDT":
+                # Prefer standard 'pair' identifier, fallback to 'coindcx_name'
                 pair_name = item.get("pair") or item.get("coindcx_name")
                 
                 # Exclude unsearchable KuCoin order books
@@ -106,18 +103,44 @@ def clean_display_symbol(pair: str) -> str:
     return clean
 
 
+def fetch_candles_with_fallback(pair: str):
+    """Attempts to fetch candles with the primary symbol, falls back to alternate formats if empty."""
+    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
+    try:
+        response = requests.get(url, timeout=8)
+        data = response.json()
+        if isinstance(data, list) and len(data) >= RSI_PERIOD + 2:
+            return data
+    except Exception:
+        pass
+
+    # Alternate format fallback (e.g. converting USELESSUSDT -> B-USELESS_USDT or USELESS_USDT)
+    alt_pair = pair
+    if "_" not in pair and pair.endswith("USDT"):
+        alt_pair = f"B-{pair[:-4]}_USDT"
+    
+    if alt_pair != pair:
+        try:
+            url_alt = f"https://public.coindcx.com/market_data/candles/?pair={alt_pair}&interval={INTERVAL}&limit=250"
+            res_alt = requests.get(url_alt, timeout=8)
+            data_alt = res_alt.json()
+            if isinstance(data_alt, list) and len(data_alt) >= RSI_PERIOD + 2:
+                return data_alt
+        except Exception:
+            pass
+
+    return None
+
+
 def evaluate_pair(pair: str):
     global tracker
     now = time.time()
-    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
+
+    data = fetch_candles_with_fallback(pair)
+    if not data:
+        return
 
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-
-        if not isinstance(data, list) or len(data) < RSI_PERIOD + 2:
-            return
-
         df = pd.DataFrame(data)
         df = df.sort_values(by="time", ascending=True).reset_index(drop=True)
         df["close"] = df["close"].astype(float)
