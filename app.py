@@ -6,16 +6,16 @@ import pandas as pd
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ----------------- DUMMY SERVER FOR RENDER ----------------- #
+# ----------------- 24/7 KEEP-ALIVE SERVER (RENDER COMPATIBLE) ----------------- #
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
-# ----------------------------------------------------------- #
+# ----------------------------------------------------------------------------- #
 
-# ----------------- CONFIGURATION ----------------- #
+# ----------------- SCANNER CONFIGURATION ----------------- #
 INTERVAL = "1h"
 RSI_PERIOD = 14
 
@@ -26,74 +26,88 @@ RSI_EXTREME_OB = 85.0
 RSI_STANDARD_OS = 20.0
 RSI_EXTREME_OS = 15.0
 
-COOLDOWN_SECONDS = 15 * 60  # 15 minutes cooldown
-CYCLE_INTERVAL_SECONDS = 60  # Scan every 1 minute
-MAX_WORKERS = 15
+COOLDOWN_SECONDS = 15 * 60     # 15-minute standard alert cooldown
+CYCLE_INTERVAL_SECONDS = 60    # 1-minute full sweep interval
+MAX_WORKERS = 15               # Concurrent execution pool
+# --------------------------------------------------------- #
 
-# Telegram Bot Credentials
+# Telegram Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
 TELEGRAM_CHAT_IDS = ["7203290966"]
-# ------------------------------------------------- #
 
+# State tracker: { pair: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
 
-def get_all_active_usdt_pairs():
-    """Fetches all tradeable USDT pairs from CoinDCX, excluding KuCoin (KC-) and INR."""
+def get_all_usdt_markets():
+    """
+    Dynamically loads all active USDT pairs across CoinDCX without hardcoded prefix locks,
+    ensuring zero assets are omitted while filtering out domestic INR books.
+    """
     url = "https://api.coindcx.com/exchange/v1/markets_details"
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, timeout=12)
+        response.raise_for_status()
         data = response.json()
-        pairs = []
+        
+        valid_pairs = []
         for item in data:
             if item.get("status") != "active":
                 continue
-            pair_name = item.get("pair") or item.get("coindcx_name")
-            base_curr = item.get("base_currency_short_name", "")
 
-            # Exclude INR and KuCoin
-            if base_curr == "INR" or (pair_name and (pair_name.startswith("KC-") or pair_name.endswith("INR"))):
+            pair_name = item.get("pair") or item.get("coindcx_name")
+            base_currency = item.get("base_currency_short_name", "")
+
+            # Exclude INR pairs to avoid duplicate alerts and illiquid books
+            if base_currency == "INR" or (pair_name and (pair_name.endswith("INR") or pair_name.endswith("_INR"))):
                 continue
 
-            if base_curr == "USDT" or (pair_name and "USDT" in pair_name):
-                if pair_name and pair_name not in pairs:
-                    pairs.append(pair_name)
+            # Capture all valid USDT pairings
+            if base_currency == "USDT" or (pair_name and "USDT" in pair_name):
+                if pair_name and pair_name not in valid_pairs:
+                    valid_pairs.append(pair_name)
 
-        print(f"Loaded {len(pairs)} active USDT pairs from CoinDCX.")
-        return sorted(pairs)
+        print(f"Loaded {len(valid_pairs)} active USDT pairs across CoinDCX.")
+        return sorted(valid_pairs)
     except Exception as e:
-        print(f"Error fetching market list: {e}")
+        print(f"Error loading market catalog: {e}")
         return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
 
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Calculates exact Wilder's Smoothed RSI matching TradingView/CoinDCX charts."""
+def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Vectorized Wilder's Exponentially Smoothed Relative Strength Index.
+    Matches standard TradingView and exchange charting engines.
+    """
     delta = series.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
 
-    # Wilder's Smoothing requires alpha = 1 / period
+    # Wilder's Smoothing: alpha = 1 / period (RMA)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
     rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def send_telegram_alert(message: str):
-    """Dispatches alerts to Telegram."""
+    """Dispatches markdown-formatted alert notifications to Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chat_id in TELEGRAM_CHAT_IDS:
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown",
+        }
         try:
-            requests.post(url, json=payload, timeout=10)
+            requests.post(url, json=payload, timeout=8)
         except Exception as e:
-            print(f"Failed to reach Telegram API: {e}")
+            print(f"Telegram dispatch failed for {chat_id}: {e}")
 
 
-def format_display_name(pair: str) -> str:
-    """Cleans pair name into standard SYMBOL/USDT layout."""
+def clean_symbol_display(pair: str) -> str:
+    """Generates standard TOKEN/USDT display formatting."""
     clean = pair.replace("B-", "").replace("KC-", "").replace("I-", "")
     if clean.endswith("_USDT"):
         return clean.replace("_USDT", "/USDT")
@@ -104,50 +118,56 @@ def format_display_name(pair: str) -> str:
     return clean
 
 
-def evaluate_pair(pair: str):
+def process_market_candle(pair: str):
     global tracker
     now = time.time()
     
-    # Request 300 candles to ensure full Wilder's RSI convergence
-    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=300"
+    # Standard 250-bar limit for optimal Wilder convergence and zero API drops
+    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
 
     try:
         response = requests.get(url, timeout=8)
         data = response.json()
 
+        # Discard broken or non-standard feeds with insufficient history
         if not isinstance(data, list) or len(data) < 30:
             return
 
         df = pd.DataFrame(data)
 
-        # CRITICAL: Convert 'time' to explicit numeric integer before sorting
-        df["time"] = pd.to_numeric(df["time"])
-        df["close"] = pd.to_numeric(df["close"])
-        df = df.sort_values(by="time", ascending=True).reset_index(drop=True)
+        # Enforce strict numeric data typing before sorting
+        df["time"] = pd.to_numeric(df["time"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["time", "close"]).sort_values(by="time", ascending=True).reset_index(drop=True)
 
-        df["rsi"] = calculate_rsi(df["close"], period=RSI_PERIOD)
+        if len(df) < 30:
+            return
 
-        # Current live candle
-        current_rsi = df["rsi"].iloc[-1]
-        live_price = df["close"].iloc[-1]
+        df["rsi"] = calculate_wilders_rsi(df["close"], period=RSI_PERIOD)
+
+        # Extract current live 1-hour bar values
+        live_candle = df.iloc[-1]
+        current_rsi = live_candle["rsi"]
+        live_price = live_candle["close"]
 
         if pd.isna(current_rsi):
             return
 
-        display_name = format_display_name(pair)
+        display_name = clean_symbol_display(pair)
 
+        # Initialize tracker state to evaluate existing extremes on boot
         if pair not in tracker:
             tracker[pair] = {"last_alert_time": 0, "last_tier": None}
 
         state = tracker[pair]
         time_since_alert = now - state["last_alert_time"]
 
-        # Reset state when RSI returns to neutral zone
+        # Reset state once RSI returns to neutral levels
         if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
             state["last_tier"] = None
             return
 
-        # ----------------- OVERBOUGHT LOGIC ----------------- #
+        # ----------------- OVERBOUGHT SIGNALS ----------------- #
         if current_rsi >= RSI_EXTREME_OB:
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
@@ -174,7 +194,7 @@ def evaluate_pair(pair: str):
                 state["last_alert_time"] = now
                 state["last_tier"] = "STANDARD_OB"
 
-        # ----------------- OVERSOLD LOGIC ----------------- #
+        # ----------------- OVERSOLD SIGNALS ----------------- #
         elif current_rsi <= RSI_EXTREME_OS:
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
@@ -205,25 +225,25 @@ def evaluate_pair(pair: str):
         pass
 
 
-def scan_all_markets(pairs):
+def execute_market_sweep(pairs):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(evaluate_pair, pair) for pair in pairs]
+        futures = [executor.submit(process_market_candle, pair) for pair in pairs]
         for future in as_completed(futures):
             pass
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Clean Live 1h RSI Scanner...")
-    all_pairs = get_all_active_usdt_pairs()
+    print("Starting CoinDCX Professional Live 1h RSI Scanner...")
+    all_pairs = get_all_usdt_markets()
 
     send_telegram_alert(
-        f"🤖 *CoinDCX Scanner Online*\n"
-        f"Monitoring `{len(all_pairs)}` USDT pairs on 1-hour live candles."
+        f"🤖 *CoinDCX Pro Scanner Active*\n"
+        f"Actively monitoring `{len(all_pairs)}` USDT pairs on 1-hour live candles."
     )
 
     while True:
         cycle_start = time.time()
-        scan_all_markets(all_pairs)
+        execute_market_sweep(all_pairs)
         elapsed = time.time() - cycle_start
         sleep_time = max(0, CYCLE_INTERVAL_SECONDS - elapsed)
         time.sleep(sleep_time)
