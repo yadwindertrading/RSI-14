@@ -32,9 +32,9 @@ CYCLE_INTERVAL_SECONDS = 60    # 1-minute full sweep interval
 MAX_WORKERS = 15               # Concurrency pool size
 # --------------------------------------------------------- #
 
-# Telegram Credentials
+# Telegram Credentials (Configured for both recipients)
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
-TELEGRAM_CHAT_IDS = ["7203290966"]
+TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 
 # State tracker: { pair: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
@@ -59,7 +59,7 @@ def get_all_usdt_markets():
             pair_name = item.get("pair") or item.get("coindcx_name")
             base_currency = item.get("base_currency_short_name", "")
 
-            # Exclude INR pairs
+            # Strictly exclude INR pairs
             if base_currency == "INR" or (pair_name and (pair_name.endswith("INR") or pair_name.endswith("_INR"))):
                 continue
 
