@@ -40,39 +40,63 @@ TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 tracker = {}
 
 
-def get_all_usdt_markets():
+def get_active_futures_pairs():
     """
-    Fetches all active USDT pairs across CoinDCX directly.
-    Excludes domestic INR pairs to avoid duplicate alerts and low-volume local books.
+    Fetches active USDT futures instruments directly from CoinDCX derivatives endpoint,
+    filtering out spot-only assets.
     """
-    url = "https://api.coindcx.com/exchange/v1/markets_details"
-    try:
-        response = requests.get(url, timeout=12)
-        response.raise_for_status()
-        data = response.json()
+    futures_url = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments"
+    markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
 
-        valid_pairs = []
-        for item in data:
+    try:
+        # 1. Fetch official active futures instruments
+        fut_resp = requests.get(futures_url, params={"margin_currency_short_name[]": "USDT"}, timeout=12)
+        fut_resp.raise_for_status()
+        fut_data = fut_resp.json()
+
+        # Extract symbols or target assets enabled for futures
+        futures_symbols = set()
+        for inst in fut_data:
+            if inst.get("status") == "active":
+                pair_name = inst.get("pair")
+                if pair_name:
+                    futures_symbols.add(pair_name)
+                # Also track target base assets (e.g., BTC, ETH) for fallback cross-referencing
+                target = inst.get("target_currency_short_name")
+                if target:
+                    futures_symbols.add(target)
+
+        # 2. Match against active USDT market pairs for candle feeds
+        mkt_resp = requests.get(markets_url, timeout=12)
+        mkt_resp.raise_for_status()
+        mkt_data = mkt_resp.json()
+
+        target_pairs = []
+        for item in mkt_data:
             if item.get("status") != "active":
                 continue
 
-            pair_name = item.get("pair") or item.get("coindcx_name")
-            base_currency = item.get("base_currency_short_name", "")
+            pair = item.get("pair") or item.get("coindcx_name")
+            base_curr = item.get("base_currency_short_name", "")
+            target_curr = item.get("target_currency_short_name", "")
 
-            # Strictly exclude INR pairs
-            if base_currency == "INR" or (pair_name and (pair_name.endswith("INR") or pair_name.endswith("_INR"))):
+            # Exclude domestic INR pairs
+            if base_curr == "INR" or (pair and (pair.endswith("INR") or pair.endswith("_INR"))):
                 continue
 
-            # Capture all active USDT markets
-            if base_currency == "USDT" or (pair_name and "USDT" in pair_name):
-                if pair_name and pair_name not in valid_pairs:
-                    valid_pairs.append(pair_name)
+            # Ensure quote is USDT
+            if base_curr == "USDT" or (pair and "USDT" in pair):
+                # Verify if this pair or underlying coin is tradable in Futures
+                if pair in futures_symbols or target_curr in futures_symbols:
+                    if pair and pair not in target_pairs:
+                        target_pairs.append(pair)
 
-        print(f"Loaded {len(valid_pairs)} active USDT pairs across CoinDCX.")
-        return sorted(valid_pairs)
+        print(f"Loaded {len(target_pairs)} active Futures USDT pairs on CoinDCX.")
+        return sorted(target_pairs)
+
     except Exception as e:
-        print(f"Error loading CoinDCX market catalog: {e}")
-        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
+        print(f"Error loading futures catalog: {e}. Falling back to core liquid futures.")
+        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-TRX_USDT"]
 
 
 def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -83,7 +107,7 @@ def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
 
-    # Wilder's Smoothing formula uses alpha = 1 / period
+    # Wilder's Smoothing formula uses alpha = 1 / period (RMA)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
@@ -173,7 +197,7 @@ def process_market_candle(pair: str):
         if current_rsi >= RSI_EXTREME_OB:
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🔥 *CRITICAL OVERBOUGHT ALERT*\n\n"
+                    f"🔥 *FUTURES CRITICAL OVERBOUGHT*\n\n"
                     f"*Pair:* `{display_name}` (`{pair}`)\n"
                     f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
@@ -186,7 +210,7 @@ def process_market_candle(pair: str):
         elif current_rsi >= RSI_STANDARD_OB:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🚨 *RSI OVERBOUGHT ALERT*\n\n"
+                    f"🚨 *FUTURES RSI OVERBOUGHT*\n\n"
                     f"*Pair:* `{display_name}` (`{pair}`)\n"
                     f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
@@ -200,7 +224,7 @@ def process_market_candle(pair: str):
         elif current_rsi <= RSI_EXTREME_OS:
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"❄️ *CRITICAL OVERSOLD ALERT*\n\n"
+                    f"❄️ *FUTURES CRITICAL OVERSOLD*\n\n"
                     f"*Pair:* `{display_name}` (`{pair}`)\n"
                     f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
@@ -213,7 +237,7 @@ def process_market_candle(pair: str):
         elif current_rsi <= RSI_STANDARD_OS:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🟢 *RSI OVERSOLD ALERT*\n\n"
+                    f"🟢 *FUTURES RSI OVERSOLD*\n\n"
                     f"*Pair:* `{display_name}` (`{pair}`)\n"
                     f"*Timeframe:* 1 Hour (Live Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
@@ -235,12 +259,12 @@ def execute_market_sweep(pairs):
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Pro Scanner (RSI <= 15 / >= 90)...")
-    all_pairs = get_all_usdt_markets()
+    print("Starting CoinDCX Futures-Only Live 1h RSI Scanner...")
+    all_pairs = get_active_futures_pairs()
 
     send_telegram_alert(
-        f"🤖 *CoinDCX Scanner Active*\n"
-        f"Monitoring `{len(all_pairs)}` USDT pairs.\n"
+        f"🤖 *CoinDCX Futures Scanner Online*\n"
+        f"Monitoring `{len(all_pairs)}` active Futures USDT pairs.\n"
         f"*Thresholds:* RSI <= {RSI_STANDARD_OS} (Oversold) | RSI >= {RSI_STANDARD_OB} (Overbought)."
     )
 
