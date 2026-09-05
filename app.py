@@ -40,70 +40,42 @@ TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 tracker = {}
 
 
-def get_all_usdt_markets_fallback():
-    """
-    Fallback loader: Returns all active USDT markets across CoinDCX without restrictions.
-    Used if the derivatives endpoint ever experiences an API timeout or outage.
-    """
-    url = "https://api.coindcx.com/exchange/v1/markets_details"
-    try:
-        resp = requests.get(url, timeout=12)
-        resp.raise_for_status()
-        data = resp.json()
-        fallback_pairs = []
-        for item in data:
-            if item.get("status") != "active":
-                continue
-            pair = item.get("pair") or item.get("coindcx_name")
-            base = item.get("base_currency_short_name", "")
-            if base == "INR" or (pair and (pair.endswith("INR") or pair.endswith("_INR"))):
-                continue
-            if base == "USDT" or (pair and "USDT" in pair):
-                if pair and pair not in fallback_pairs:
-                    fallback_pairs.append(pair)
-        return sorted(fallback_pairs)
-    except Exception as e:
-        print(f"Fallback fetch failed: {e}")
-        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
-
-
 def get_active_futures_pairs():
     """
-    Queries CoinDCX's active instruments endpoint to isolate only tokens enabled
-    for Futures trading, eliminating spot-only assets automatically.
+    Fetches active USDT futures instruments directly from CoinDCX derivatives endpoint.
+    Strictly filters out spot-only assets (like RAIN) by verifying the token exists in Futures.
     """
-    # Raw URL prevents requests library from percent-encoding brackets into %5B%5D
     futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT"
     markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
 
+    futures_assets = set()
     try:
         fut_resp = requests.get(futures_endpoint, timeout=12)
         fut_resp.raise_for_status()
         fut_data = fut_resp.json()
 
-        # Handle list or nested data dictionary formats
         instruments = fut_data if isinstance(fut_data, list) else fut_data.get("data", [])
-        
-        futures_assets = set()
         for inst in instruments:
-            # Check for active status
-            status = inst.get("status", "").lower()
+            status = str(inst.get("status", "")).lower()
             if status not in ["active", "trading", ""]:
                 continue
 
-            pair_name = inst.get("pair")
-            if pair_name:
-                futures_assets.add(pair_name)
-
-            target = inst.get("target_currency_short_name") or inst.get("target_currency")
+            pair_symbol = inst.get("pair")
+            target = inst.get("target_currency_short_name") or inst.get("base_currency_short_name")
+            
             if target:
                 futures_assets.add(target.upper())
+            if pair_symbol:
+                futures_assets.add(pair_symbol)
+                # Clean normalized ticker without prefix/suffix (e.g., 'B-BTC_USDT' -> 'BTC')
+                clean = pair_symbol.replace("B-", "").replace("_USDT", "").replace("USDT", "")
+                futures_assets.add(clean.upper())
 
-        if not futures_assets:
-            print("Futures endpoint returned 0 instruments. Falling back to all USDT pairs.")
-            return get_all_usdt_markets_fallback()
+        print(f"Loaded {len(futures_assets)} unique active Futures assets from CoinDCX derivatives endpoint.")
+    except Exception as e:
+        print(f"Failed to query futures catalog: {e}")
 
-        # Fetch market details to map to candle feeds
+    try:
         mkt_resp = requests.get(markets_url, timeout=12)
         mkt_resp.raise_for_status()
         mkt_data = mkt_resp.json()
@@ -115,29 +87,33 @@ def get_active_futures_pairs():
 
             pair = item.get("pair") or item.get("coindcx_name")
             base_curr = item.get("base_currency_short_name", "")
-            target_curr = item.get("target_currency_short_name", "")
+            target_curr = item.get("target_currency_short_name", "").upper()
 
             # Exclude INR pairs
             if base_curr == "INR" or (pair and (pair.endswith("INR") or pair.endswith("_INR"))):
                 continue
 
+            # Must be a USDT pair
             if base_curr == "USDT" or (pair and "USDT" in pair):
-                # Include if the pair identifier or target coin is in active futures
-                if pair in futures_assets or target_curr.upper() in futures_assets:
-                    if pair and pair not in active_futures_pairs:
-                        active_futures_pairs.append(pair)
+                # Strict filter: verify token exists in active Futures directory
+                if futures_assets:
+                    has_future = (
+                        target_curr in futures_assets
+                        or (pair and pair in futures_assets)
+                        or (pair and pair.replace("B-", "").replace("_USDT", "").replace("USDT", "").upper() in futures_assets)
+                    )
+                    if not has_future:
+                        continue  # Discards spot-only listings like RAIN
 
-        # Validate minimum expected size (CoinDCX has 200+ futures pairs)
-        if len(active_futures_pairs) < 50:
-            print(f"Warning: Only matched {len(active_futures_pairs)} pairs. Using full catalog fallback.")
-            return get_all_usdt_markets_fallback()
+                if pair and pair not in active_futures_pairs:
+                    active_futures_pairs.append(pair)
 
-        print(f"Successfully loaded {len(active_futures_pairs)} active CoinDCX Futures pairs.")
+        print(f"Successfully loaded {len(active_futures_pairs)} active CoinDCX Futures-eligible USDT pairs.")
         return sorted(active_futures_pairs)
 
     except Exception as e:
-        print(f"Error querying futures catalog: {e}. Defaulting to full USDT catalog to prevent missing alerts.")
-        return get_all_usdt_markets_fallback()
+        print(f"Error filtering markets catalog: {e}. Falling back to core liquid futures pairs.")
+        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-XRP_USDT", "B-BNB_USDT"]
 
 
 def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
