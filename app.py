@@ -18,7 +18,8 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # ----------------- SCANNER CONFIGURATION ----------------- #
 INTERVAL = "1h"
 RSI_PERIOD = 14
-MIN_CANDLES_REQUIRED = 50      # Minimum historical bars required for calculation
+CANDLE_LIMIT = 250             # 250 bars ensures >99.999% Wilder's convergence
+MIN_CANDLES_REQUIRED = 50      # Bars required to compute stable RSI
 
 # Alert Thresholds
 RSI_STANDARD_OB = 90.0
@@ -36,89 +37,51 @@ MAX_WORKERS = 15               # Concurrency pool size
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
 TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 
-# State tracker: { pair: {"last_alert_time": float, "last_tier": str} }
+# State tracker: { symbol: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
 
 def get_active_futures_pairs():
     """
-    Fetches active USDT futures instruments directly from CoinDCX derivatives endpoint.
-    Strictly filters out spot-only assets (like RAIN) by verifying the token exists in Futures.
+    1. Fetches active CoinDCX futures contracts directly from their active_instruments endpoint.
+    2. Converts them to standard perpetual symbols (e.g. 'B-BTC_USDT' -> 'BTCUSDT', 'B-B_USDT' -> 'BUSDT').
+    3. Guarantees 0 spot-only assets are included.
     """
-    futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments?margin_currency_short_name[]=USDT"
-    markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
-
-    futures_assets = set()
+    futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments"
+    
     try:
-        fut_resp = requests.get(futures_endpoint, timeout=12)
-        fut_resp.raise_for_status()
-        fut_data = fut_resp.json()
+        resp = requests.get(futures_endpoint, timeout=12)
+        resp.raise_for_status()
+        raw_list = resp.json()
 
-        instruments = fut_data if isinstance(fut_data, list) else fut_data.get("data", [])
-        for inst in instruments:
-            status = str(inst.get("status", "")).lower()
-            if status not in ["active", "trading", ""]:
-                continue
+        instruments = raw_list if isinstance(raw_list, list) else raw_list.get("data", [])
+        
+        futures_symbols = []
+        for item in instruments:
+            # Handle plain string array directly: ["B-BTC_USDT", "B-B_USDT", ...]
+            if isinstance(item, str):
+                if "USDT" in item:
+                    # Strip 'B-', 'KC-', underscores to get exact perpetual ticker (e.g., 'BUSDT', 'BTCUSDT')
+                    clean = item.split("-", 1)[-1].replace("_", "").upper()
+                    futures_symbols.append(clean)
+            elif isinstance(item, dict):
+                pair = item.get("pair") or item.get("symbol", "")
+                if "USDT" in pair:
+                    clean = pair.split("-", 1)[-1].replace("_", "").upper()
+                    futures_symbols.append(clean)
 
-            pair_symbol = inst.get("pair")
-            target = inst.get("target_currency_short_name") or inst.get("base_currency_short_name")
-            
-            if target:
-                futures_assets.add(target.upper())
-            if pair_symbol:
-                futures_assets.add(pair_symbol)
-                # Clean normalized ticker without prefix/suffix (e.g., 'B-BTC_USDT' -> 'BTC')
-                clean = pair_symbol.replace("B-", "").replace("_USDT", "").replace("USDT", "")
-                futures_assets.add(clean.upper())
-
-        print(f"Loaded {len(futures_assets)} unique active Futures assets from CoinDCX derivatives endpoint.")
-    except Exception as e:
-        print(f"Failed to query futures catalog: {e}")
-
-    try:
-        mkt_resp = requests.get(markets_url, timeout=12)
-        mkt_resp.raise_for_status()
-        mkt_data = mkt_resp.json()
-
-        active_futures_pairs = []
-        for item in mkt_data:
-            if item.get("status") != "active":
-                continue
-
-            pair = item.get("pair") or item.get("coindcx_name")
-            base_curr = item.get("base_currency_short_name", "")
-            target_curr = item.get("target_currency_short_name", "").upper()
-
-            # Exclude INR pairs
-            if base_curr == "INR" or (pair and (pair.endswith("INR") or pair.endswith("_INR"))):
-                continue
-
-            # Must be a USDT pair
-            if base_curr == "USDT" or (pair and "USDT" in pair):
-                # Strict filter: verify token exists in active Futures directory
-                if futures_assets:
-                    has_future = (
-                        target_curr in futures_assets
-                        or (pair and pair in futures_assets)
-                        or (pair and pair.replace("B-", "").replace("_USDT", "").replace("USDT", "").upper() in futures_assets)
-                    )
-                    if not has_future:
-                        continue  # Discards spot-only listings like RAIN
-
-                if pair and pair not in active_futures_pairs:
-                    active_futures_pairs.append(pair)
-
-        print(f"Successfully loaded {len(active_futures_pairs)} active CoinDCX Futures-eligible USDT pairs.")
-        return sorted(active_futures_pairs)
+        unique_symbols = sorted(list(set(futures_symbols)))
+        print(f"Loaded {len(unique_symbols)} active CoinDCX Futures perpetual contracts.")
+        return unique_symbols
 
     except Exception as e:
-        print(f"Error filtering markets catalog: {e}. Falling back to core liquid futures pairs.")
-        return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-XRP_USDT", "B-BNB_USDT"]
+        print(f"Error querying CoinDCX futures directory: {e}. Using core liquid contracts.")
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 
 def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """
-    Vectorized Wilder's Exponentially Smoothed RSI (matching TradingView and CoinDCX).
+    Vectorized Wilder's Exponentially Smoothed RSI (matching TradingView and exchange engines).
     """
     delta = series.diff()
     gain = delta.clip(lower=0.0)
@@ -133,7 +96,7 @@ def calculate_wilders_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def send_telegram_alert(message: str):
-    """Sends markdown-formatted alert notifications to Telegram."""
+    """Dispatches markdown-formatted alert notifications to all registered Telegram chats."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chat_id in TELEGRAM_CHAT_IDS:
         payload = {
@@ -147,65 +110,58 @@ def send_telegram_alert(message: str):
             print(f"Telegram dispatch failed for {chat_id}: {e}")
 
 
-def clean_symbol_display(pair: str) -> str:
-    """Formats internal exchange symbols into clean TOKEN/USDT layouts."""
-    clean = pair.replace("B-", "").replace("KC-", "").replace("I-", "")
-    if clean.endswith("_USDT"):
-        return clean.replace("_USDT", "/USDT")
-    elif clean.endswith("USDT") and not clean.endswith("/USDT"):
-        return clean[:-4] + "/USDT"
-    elif "_" in clean:
-        return clean.replace("_", "/")
-    return clean
+def format_display_symbol(symbol: str) -> str:
+    """Formats raw tickers into readable format (e.g. 'BUSDT' -> 'B/USDT', 'BTCUSDT' -> 'BTC/USDT')."""
+    if symbol.endswith("USDT"):
+        return f"{symbol[:-4]}/USDT"
+    return symbol
 
 
-def process_market_candle(pair: str):
+def process_futures_candle(symbol: str):
     global tracker
     now = time.time()
 
-    url = f"https://public.coindcx.com/market_data/candles/?pair={pair}&interval={INTERVAL}&limit=250"
+    # Pulls directly from the Futures Perpetual klines feed
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
 
     try:
         response = requests.get(url, timeout=8)
         data = response.json()
 
+        # Discard invalid responses or tokens without minimum history
         if not isinstance(data, list) or len(data) < MIN_CANDLES_REQUIRED:
             return
 
+        # Binance Futures Kline format: [0: open_time, 1: open, 2: high, 3: low, 4: close, ...]
         df = pd.DataFrame(data)
+        time_series = pd.to_numeric(df[0], errors="coerce")
+        close_series = pd.to_numeric(df[4], errors="coerce")
 
-        # 1. Enforce strict numeric data typing (handles Unix millisecond timestamps)
-        df["time"] = pd.to_numeric(df["time"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["time", "close"])
+        clean_df = pd.DataFrame({"time": time_series, "close": close_series}).dropna()
+        clean_df = clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
 
-        # 2. Monotonic Array Normalization (Prune duplicates & sort chronologically)
-        df = df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
-
-        if len(df) < MIN_CANDLES_REQUIRED:
+        if len(clean_df) < MIN_CANDLES_REQUIRED:
             return
 
-        # 3. Calculate exact Wilder's RSI
-        df["rsi"] = calculate_wilders_rsi(df["close"], period=RSI_PERIOD)
+        clean_df["rsi"] = calculate_wilders_rsi(clean_df["close"], period=RSI_PERIOD)
 
-        # Extract current running 1-hour live candle
-        live_candle = df.iloc[-1]
+        # Extract current live 1-hour candle
+        live_candle = clean_df.iloc[-1]
         current_rsi = live_candle["rsi"]
         live_price = live_candle["close"]
 
         if pd.isna(current_rsi):
             return
 
-        display_name = clean_symbol_display(pair)
+        display_name = format_display_symbol(symbol)
 
-        # Initialize tracker state for immediate evaluation upon boot
-        if pair not in tracker:
-            tracker[pair] = {"last_alert_time": 0, "last_tier": None}
+        if symbol not in tracker:
+            tracker[symbol] = {"last_alert_time": 0, "last_tier": None}
 
-        state = tracker[pair]
+        state = tracker[symbol]
         time_since_alert = now - state["last_alert_time"]
 
-        # Reset state when RSI returns to neutral levels
+        # Reset state when RSI returns to neutral territory
         if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
             state["last_tier"] = None
             return
@@ -215,10 +171,10 @@ def process_market_candle(pair: str):
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🔥 *FUTURES CRITICAL OVERBOUGHT*\n\n"
-                    f"*Pair:* `{display_name}` (`{pair}`)\n"
-                    f"*Timeframe:* 1 Hour (Live Candle)\n"
+                    f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
-                    f"*Live Price:* `${live_price}`"
+                    f"*Live Futures Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -228,10 +184,10 @@ def process_market_candle(pair: str):
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🚨 *FUTURES RSI OVERBOUGHT*\n\n"
-                    f"*Pair:* `{display_name}` (`{pair}`)\n"
-                    f"*Timeframe:* 1 Hour (Live Candle)\n"
+                    f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
-                    f"*Live Price:* `${live_price}`"
+                    f"*Live Futures Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -242,10 +198,10 @@ def process_market_candle(pair: str):
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"❄️ *FUTURES CRITICAL OVERSOLD*\n\n"
-                    f"*Pair:* `{display_name}` (`{pair}`)\n"
-                    f"*Timeframe:* 1 Hour (Live Candle)\n"
+                    f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
-                    f"*Live Price:* `${live_price}`"
+                    f"*Live Futures Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -255,10 +211,10 @@ def process_market_candle(pair: str):
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🟢 *FUTURES RSI OVERSOLD*\n\n"
-                    f"*Pair:* `{display_name}` (`{pair}`)\n"
-                    f"*Timeframe:* 1 Hour (Live Candle)\n"
+                    f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
-                    f"*Live Price:* `${live_price}`"
+                    f"*Live Futures Price:* `${live_price}`"
                 )
                 send_telegram_alert(msg)
                 state["last_alert_time"] = now
@@ -268,26 +224,26 @@ def process_market_candle(pair: str):
         pass
 
 
-def execute_market_sweep(pairs):
+def execute_market_sweep(symbols):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_market_candle, pair) for pair in pairs]
+        futures = [executor.submit(process_futures_candle, sym) for sym in symbols]
         for future in as_completed(futures):
             pass
 
 
 if __name__ == "__main__":
     print("Starting CoinDCX Futures-Only Live 1h RSI Scanner...")
-    all_pairs = get_active_futures_pairs()
+    all_symbols = get_active_futures_pairs()
 
     send_telegram_alert(
         f"🤖 *CoinDCX Futures Scanner Online*\n"
-        f"Monitoring `{len(all_pairs)}` active Futures USDT pairs.\n"
+        f"Monitoring `{len(all_symbols)}` active Perpetual Futures contracts.\n"
         f"*Thresholds:* RSI <= {RSI_STANDARD_OS} (Oversold) | RSI >= {RSI_STANDARD_OB} (Overbought)."
     )
 
     while True:
         cycle_start = time.time()
-        execute_market_sweep(all_pairs)
+        execute_market_sweep(all_symbols)
         elapsed = time.time() - cycle_start
         sleep_time = max(0, CYCLE_INTERVAL_SECONDS - elapsed)
         time.sleep(sleep_time)
