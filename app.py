@@ -18,15 +18,15 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # ----------------- SCANNER CONFIGURATION ----------------- #
 INTERVAL = "1h"
 RSI_PERIOD = 14
-CANDLE_LIMIT = 250             # 250 bars ensures >99.999% Wilder's convergence
-MIN_CANDLES_REQUIRED = 50      # Bars required to compute stable RSI
+CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
+MIN_CANDLES_REQUIRED = 50      # Minimum historical bars required to compute reliable RSI
 
 # Alert Thresholds
 RSI_STANDARD_OB = 90.0
 RSI_EXTREME_OB = 95.0
 
-RSI_STANDARD_OS = 15.0
-RSI_EXTREME_OS = 10.0
+RSI_STANDARD_OS = 12.0         # Updated from 10.0 to 12.0
+RSI_EXTREME_OS = 9.0           # Updated from 5.0 to 9.0
 
 COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown for repeated alerts
 CYCLE_INTERVAL_SECONDS = 60    # 1-minute full sweep interval
@@ -43,9 +43,9 @@ tracker = {}
 
 def get_active_futures_pairs():
     """
-    1. Fetches active CoinDCX futures contracts directly from their active_instruments endpoint.
-    2. Converts them to standard perpetual symbols (e.g. 'B-BTC_USDT' -> 'BTCUSDT', 'B-B_USDT' -> 'BUSDT').
-    3. Guarantees 0 spot-only assets are included.
+    1. Fetches active CoinDCX futures contracts directly from active_instruments endpoint.
+    2. Converts them to standard perpetual tickers (e.g. 'B-BTC_USDT' -> 'BTCUSDT', 'B-B_USDT' -> 'BUSDT').
+    3. Excludes all spot-only assets automatically.
     """
     futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments"
     
@@ -58,10 +58,9 @@ def get_active_futures_pairs():
         
         futures_symbols = []
         for item in instruments:
-            # Handle plain string array directly: ["B-BTC_USDT", "B-B_USDT", ...]
+            # Handle plain string array format directly: ["B-BTC_USDT", "B-B_USDT", ...]
             if isinstance(item, str):
                 if "USDT" in item:
-                    # Strip 'B-', 'KC-', underscores to get exact perpetual ticker (e.g., 'BUSDT', 'BTCUSDT')
                     clean = item.split("-", 1)[-1].replace("_", "").upper()
                     futures_symbols.append(clean)
             elif isinstance(item, dict):
@@ -193,7 +192,7 @@ def process_futures_candle(symbol: str):
                 state["last_alert_time"] = now
                 state["last_tier"] = "STANDARD_OB"
 
-        # ----------------- OVERSOLD SIGNALS (<= 15.0) ----------------- #
+        # ----------------- OVERSOLD SIGNALS (<= 12.0) ----------------- #
         elif current_rsi <= RSI_EXTREME_OS:
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
