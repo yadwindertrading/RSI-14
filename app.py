@@ -5,6 +5,8 @@ import requests
 import pandas as pd
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ----------------- 24/7 KEEP-ALIVE SERVER (RENDER COMPATIBLE) ----------------- #
 def run_dummy_server():
@@ -28,30 +30,41 @@ RSI_EXTREME_OB = 95.0
 RSI_STANDARD_OS = 12.0
 RSI_EXTREME_OS = 9.0
 
-COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown for repeated alerts
-CYCLE_INTERVAL_SECONDS = 60    # 1-minute full sweep interval
+COOLDOWN_SECONDS = 15 * 60     # 15-minute reminder cooldown if setup remains active
+CYCLE_INTERVAL_SECONDS = 180   # 3-minute full sweep interval (paces requests safely)
 HEARTBEAT_INTERVAL_SECONDS = 6 * 3600  # 6-hour status ping
-MAX_WORKERS = 20               # Concurrency pool size
+MAX_WORKERS = 6                # Paced concurrency to eliminate HTTP 429 rate limits
 # --------------------------------------------------------- #
 
-# Telegram Credentials (Configured for both recipients)
+# Telegram Credentials
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
 TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 
 # State tracker: { symbol: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
+# Reusable HTTP Session with automated connection pooling and retries
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    raise_on_status=False
+)
+adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=15)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
 
 def get_active_futures_pairs():
     """
-    1. Fetches active CoinDCX futures contracts directly from active_instruments endpoint.
-    2. Converts them to standard perpetual tickers (e.g. 'B-BTC_USDT' -> 'BTCUSDT', 'B-B_USDT' -> 'BUSDT').
-    3. Excludes all spot-only assets automatically.
+    Fetches active CoinDCX futures contracts directly from active_instruments endpoint.
+    Converts them to standard perpetual tickers (e.g. 'B-BTC_USDT' -> 'BTCUSDT').
     """
     futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments"
     
     try:
-        resp = requests.get(futures_endpoint, timeout=12)
+        resp = session.get(futures_endpoint, timeout=12)
         resp.raise_for_status()
         raw_list = resp.json()
 
@@ -70,11 +83,11 @@ def get_active_futures_pairs():
                     futures_symbols.append(clean)
 
         unique_symbols = sorted(list(set(futures_symbols)))
-        print(f"Loaded {len(unique_symbols)} active CoinDCX Futures perpetual contracts.")
+        print(f"Loaded {len(unique_symbols)} active CoinDCX Futures perpetual contracts.", flush=True)
         return unique_symbols
 
     except Exception as e:
-        print(f"Error querying CoinDCX futures directory: {e}. Using core liquid contracts.")
+        print(f"Error querying CoinDCX futures directory: {e}. Using core liquid contracts.", flush=True)
         return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 
@@ -103,13 +116,13 @@ def send_telegram_alert(message: str):
             "parse_mode": "Markdown",
         }
         try:
-            requests.post(url, json=payload, timeout=8)
+            session.post(url, json=payload, timeout=8)
         except Exception as e:
-            print(f"Telegram dispatch failed for {chat_id}: {e}")
+            print(f"Telegram dispatch failed for {chat_id}: {e}", flush=True)
 
 
 def format_display_symbol(symbol: str) -> str:
-    """Formats raw tickers into readable format (e.g. 'BUSDT' -> 'B/USDT', 'BTCUSDT' -> 'BTC/USDT')."""
+    """Formats raw tickers into readable format (e.g. 'BTCUSDT' -> 'BTC/USDT')."""
     if symbol.endswith("USDT"):
         return f"{symbol[:-4]}/USDT"
     return symbol
@@ -123,9 +136,11 @@ def process_futures_candle(symbol: str):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
 
     try:
-        response = requests.get(url, timeout=8)
-        data = response.json()
+        response = session.get(url, timeout=8)
+        if response.status_code != 200:
+            return
 
+        data = response.json()
         if not isinstance(data, list) or len(data) < MIN_CANDLES_REQUIRED:
             return
 
@@ -156,13 +171,14 @@ def process_futures_candle(symbol: str):
         state = tracker[symbol]
         time_since_alert = now - state["last_alert_time"]
 
-        # Reset state when RSI returns to neutral territory
+        # Reset tracker state only when RSI returns completely to neutral territory
         if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
             state["last_tier"] = None
             return
 
         # ----------------- OVERBOUGHT SIGNALS (>= 90.0) ----------------- #
         if current_rsi >= RSI_EXTREME_OB:
+            # Alert on initial entry OR after 15m cooldown reminder
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🔥 *FUTURES CRITICAL OVERBOUGHT*\n\n"
@@ -176,7 +192,8 @@ def process_futures_candle(symbol: str):
                 state["last_tier"] = "EXTREME_OB"
 
         elif current_rsi >= RSI_STANDARD_OB:
-            if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
+            # UNLOCKED: Alerts immediately on initial entry OR after 15m cooldown reminder
+            if state["last_tier"] != "STANDARD_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🚨 *FUTURES RSI OVERBOUGHT*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
@@ -203,7 +220,8 @@ def process_futures_candle(symbol: str):
                 state["last_tier"] = "EXTREME_OS"
 
         elif current_rsi <= RSI_STANDARD_OS:
-            if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
+            # UNLOCKED: Alerts immediately on initial entry OR after 15m cooldown reminder
+            if state["last_tier"] != "STANDARD_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
                     f"🟢 *FUTURES RSI OVERSOLD*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
@@ -227,13 +245,14 @@ def execute_market_sweep(symbols):
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Futures-Only Live 1h RSI Scanner...")
+    print("Starting CoinDCX Futures-Only Live 1h RSI Scanner...", flush=True)
     all_symbols = get_active_futures_pairs()
 
     send_telegram_alert(
         f"🤖 *CoinDCX Futures Scanner Online*\n\n"
         f"• *Contracts:* `{len(all_symbols)}` active perpetuals\n"
         f"• *Timeframe:* `1 Hour (Live Candle)`\n"
+        f"• *Paced Interval:* ~3 Minutes per full market sweep\n"
         f"• *Thresholds:* RSI <= {RSI_STANDARD_OS} / {RSI_EXTREME_OS} (Oversold) | RSI >= {RSI_STANDARD_OB} / {RSI_EXTREME_OB} (Overbought)\n"
         f"• *Heartbeat:* Status ping every 6 hours."
     )
@@ -256,5 +275,6 @@ if __name__ == "__main__":
             last_heartbeat_time = time.time()
 
         elapsed = time.time() - cycle_start
+        print(f"Cycle completed in {elapsed:.2f} seconds across {len(all_symbols)} tokens.", flush=True)
         sleep_time = max(0, CYCLE_INTERVAL_SECONDS - elapsed)
         time.sleep(sleep_time)
