@@ -16,8 +16,9 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # ----------------------------------------------------------------------------- #
 
 # ----------------- SCANNER CONFIGURATION ----------------- #
+INTERVAL = "1h"
 RSI_PERIOD = 14
-CANDLE_LIMIT = 250             # Ensures full Wilder's RMA mathematical convergence
+CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
 MIN_CANDLES_REQUIRED = 50      # Minimum historical bars required to compute reliable RSI
 
 # Alert Thresholds
@@ -27,7 +28,7 @@ RSI_EXTREME_OB = 95.0
 RSI_STANDARD_OS = 12.0
 RSI_EXTREME_OS = 9.0
 
-COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown for repeated alerts per timeframe
+COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown for repeated alerts
 CYCLE_INTERVAL_SECONDS = 60    # 1-minute full sweep interval
 HEARTBEAT_INTERVAL_SECONDS = 6 * 3600  # 6-hour status ping
 MAX_WORKERS = 20               # Concurrency pool size
@@ -37,7 +38,7 @@ MAX_WORKERS = 20               # Concurrency pool size
 TELEGRAM_BOT_TOKEN = "8871724356:AAEQb7OP9gvoDLDKebLIpywuGdE8aVFka3A"
 TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 
-# State tracker: { (symbol, interval): {"last_alert_time": float, "last_tier": str} }
+# State tracker: { symbol: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
 
@@ -114,13 +115,12 @@ def format_display_symbol(symbol: str) -> str:
     return symbol
 
 
-def evaluate_timeframe(symbol: str, interval: str, prefix: str):
-    """Evaluates a single timeframe (1h or 1d) independently for a given perpetual symbol."""
+def process_futures_candle(symbol: str):
+    """Processes live 1-hour candles for a given contract and checks alert conditions."""
     global tracker
     now = time.time()
-    tracker_key = (symbol, interval)
 
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
 
     try:
         response = requests.get(url, timeout=8)
@@ -150,10 +150,10 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
 
         display_name = format_display_symbol(symbol)
 
-        if tracker_key not in tracker:
-            tracker[tracker_key] = {"last_alert_time": 0, "last_tier": None}
+        if symbol not in tracker:
+            tracker[symbol] = {"last_alert_time": 0, "last_tier": None}
 
-        state = tracker[tracker_key]
+        state = tracker[symbol]
         time_since_alert = now - state["last_alert_time"]
 
         # Reset state when RSI returns to neutral territory
@@ -165,8 +165,9 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
         if current_rsi >= RSI_EXTREME_OB:
             if state["last_tier"] != "EXTREME_OB" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🔥 *{prefix} CRITICAL OVERBOUGHT*\n\n"
+                    f"🔥 *FUTURES CRITICAL OVERBOUGHT*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
                     f"*Live Futures Price:* `${live_price}`"
                 )
@@ -177,8 +178,9 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
         elif current_rsi >= RSI_STANDARD_OB:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🚨 *{prefix} RSI OVERBOUGHT*\n\n"
+                    f"🚨 *FUTURES RSI OVERBOUGHT*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
                     f"*Live Futures Price:* `${live_price}`"
                 )
@@ -190,8 +192,9 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
         elif current_rsi <= RSI_EXTREME_OS:
             if state["last_tier"] != "EXTREME_OS" or time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"❄️ *{prefix} CRITICAL OVERSOLD*\n\n"
+                    f"❄️ *FUTURES CRITICAL OVERSOLD*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
                     f"*Live Futures Price:* `${live_price}`"
                 )
@@ -202,8 +205,9 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
         elif current_rsi <= RSI_STANDARD_OS:
             if state["last_tier"] is None and time_since_alert >= COOLDOWN_SECONDS:
                 msg = (
-                    f"🟢 *{prefix} RSI OVERSOLD*\n\n"
+                    f"🟢 *FUTURES RSI OVERSOLD*\n\n"
                     f"*Pair:* `{display_name}` (`{symbol}`)\n"
+                    f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                     f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
                     f"*Live Futures Price:* `${live_price}`"
                 )
@@ -215,28 +219,22 @@ def evaluate_timeframe(symbol: str, interval: str, prefix: str):
         pass
 
 
-def process_symbol_candles(symbol: str):
-    """Processes 1-hour and Daily candles independently for a given contract."""
-    evaluate_timeframe(symbol, interval="1h", prefix="1 HOUR")
-    evaluate_timeframe(symbol, interval="1d", prefix="DAILY")
-
-
 def execute_market_sweep(symbols):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_symbol_candles, sym) for sym in symbols]
+        futures = [executor.submit(process_futures_candle, sym) for sym in symbols]
         for future in as_completed(futures):
             pass
 
 
 if __name__ == "__main__":
-    print("Starting CoinDCX Dual-Timeframe Futures Scanner (1H & 1D)...")
+    print("Starting CoinDCX Futures-Only Live 1h RSI Scanner...")
     all_symbols = get_active_futures_pairs()
 
     send_telegram_alert(
         f"🤖 *CoinDCX Futures Scanner Online*\n\n"
         f"• *Contracts:* `{len(all_symbols)}` active perpetuals\n"
-        f"• *Timeframes:* `1 HOUR` & `DAILY` (Independent)\n"
-        f"• *Thresholds:* RSI <= {RSI_STANDARD_OS} / {RSI_EXTREME_OS} | RSI >= {RSI_STANDARD_OB} / {RSI_EXTREME_OB}\n"
+        f"• *Timeframe:* `1 Hour (Live Candle)`\n"
+        f"• *Thresholds:* RSI <= {RSI_STANDARD_OS} / {RSI_EXTREME_OS} (Oversold) | RSI >= {RSI_STANDARD_OB} / {RSI_EXTREME_OB} (Overbought)\n"
         f"• *Heartbeat:* Status ping every 6 hours."
     )
 
@@ -252,7 +250,7 @@ if __name__ == "__main__":
                 f"💓 *System Status (6-Hour Heartbeat)*\n\n"
                 f"• *Status:* Active & Scanning\n"
                 f"• *Monitored Contracts:* `{len(all_symbols)}`\n"
-                f"• *Timeframes:* `1 HOUR` & `DAILY`\n"
+                f"• *Timeframe:* `1h`\n"
                 f"• *Parameters:* RSI <= {RSI_STANDARD_OS} | RSI >= {RSI_STANDARD_OB}"
             )
             last_heartbeat_time = time.time()
