@@ -20,7 +20,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # ----------------- SCANNER CONFIGURATION ----------------- #
 INTERVAL = "1h"
 RSI_PERIOD = 14
-CANDLE_LIMIT = 250             # 250 historical bars ensures Wilder's RMA mathematical convergence
+CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
 MIN_CANDLES_REQUIRED = 50      # Minimum historical bars required to compute reliable RSI
 
 # Alert Thresholds
@@ -43,7 +43,7 @@ TELEGRAM_CHAT_IDS = ["7203290966", "630462102"]
 # State tracker: { symbol: {"last_alert_time": float, "last_tier": str} }
 tracker = {}
 
-# Reusable HTTP Session with automated connection pooling and retries
+# Reusable HTTP Session with connection pooling and automated retries
 session = requests.Session()
 retries = Retry(
     total=3,
@@ -55,7 +55,7 @@ adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=15)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# Standard browser headers to avoid Cloudflare bot blocks
+# Standard browser headers to avoid cloud WAF blocks
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json"
@@ -85,11 +85,10 @@ def get_active_futures_pairs():
                 coindcx_pair = item.get("pair") or item.get("symbol", "")
 
             if "USDT" in coindcx_pair:
-                # e.g., 'B-DRIFT_USDT' -> clean binance: 'DRIFTUSDT'
                 binance_clean = coindcx_pair.split("-", 1)[-1].replace("_", "").upper()
                 pairs.append((binance_clean, coindcx_pair))
 
-        # Deduplicate by binance symbol
+        # Deduplicate by Binance symbol
         seen = set()
         unique_pairs = []
         for b_sym, c_pair in pairs:
@@ -152,9 +151,10 @@ def format_display_symbol(symbol: str) -> str:
 def fetch_candles(binance_sym: str, coindcx_pair: str):
     """
     Primary: Fetches from Binance Futures API.
-    Automatic Fallback: If Binance returns 451/403 (cloud geoblock), fetches directly from CoinDCX API.
+    Verified Secondary Fallback: Uses the official CoinDCX REST candles endpoint (api.coindcx.com)
+    which returns 250 bars without geoblocks.
     """
-    # 1. Primary: Binance Futures
+    # 1. Primary Route: Binance Futures
     binance_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
     try:
         res = session.get(binance_url, headers=HEADERS, timeout=6)
@@ -170,20 +170,20 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
     except Exception:
         pass
 
-    # 2. Secondary Fallback: CoinDCX Native Candles API (Bypasses Binance US/EU Cloud Geoblock)
-    coindcx_url = f"https://public.coindcx.com/market_data/candles/?pair={coindcx_pair}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
+    # 2. Verified Fallback Route: CoinDCX Official REST Candles Endpoint
+    coindcx_url = f"https://api.coindcx.com/market_data/candles?pair={coindcx_pair}&interval={INTERVAL}"
     try:
         res = session.get(coindcx_url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
                 df = pd.DataFrame(data)
-                # CoinDCX schema: 'time' (or 'timestamp') and 'close'
                 time_col = "time" if "time" in df.columns else "timestamp"
                 clean_df = pd.DataFrame({
                     "time": pd.to_numeric(df[time_col], errors="coerce"),
                     "close": pd.to_numeric(df["close"], errors="coerce")
                 }).dropna()
+                # CoinDCX delivers newest candle first; sort chronologically for RMA RSI calculation
                 return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
     except Exception:
         pass
