@@ -21,7 +21,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 INTERVAL = "1h"
 RSI_PERIOD = 14
 CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
-MIN_CANDLES_REQUIRED = 50      # Minimum historical bars required to compute reliable RSI
+MIN_CANDLES_REQUIRED = 20      # Scaled down to 20 bars to support valid newly listed assets
 
 # Alert Thresholds
 RSI_STANDARD_OB = 90.0
@@ -55,7 +55,7 @@ adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=15)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# Standard browser headers to avoid cloud WAF blocks
+# Standard browser headers to prevent cloud WAF drops
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json"
@@ -64,8 +64,8 @@ HEADERS = {
 
 def get_active_futures_pairs():
     """
-    1. Fetches active CoinDCX futures contracts directly from active_instruments endpoint.
-    2. Maps CoinDCX pairs (e.g. 'B-BTC_USDT') to both CoinDCX format and Binance ticker ('BTCUSDT').
+    Fetches all active CoinDCX futures contracts directly from active_instruments.
+    Preserves both the clean Binance ticker and the original CoinDCX pair identifier.
     """
     futures_endpoint = "https://api.coindcx.com/exchange/v1/derivatives/futures/data/active_instruments"
     
@@ -88,7 +88,7 @@ def get_active_futures_pairs():
                 binance_clean = coindcx_pair.split("-", 1)[-1].replace("_", "").upper()
                 pairs.append((binance_clean, coindcx_pair))
 
-        # Deduplicate by Binance symbol
+        # Deduplicate while preserving mapping
         seen = set()
         unique_pairs = []
         for b_sym, c_pair in pairs:
@@ -150,11 +150,12 @@ def format_display_symbol(symbol: str) -> str:
 
 def fetch_candles(binance_sym: str, coindcx_pair: str):
     """
-    Primary: Fetches from Binance Futures API.
-    Verified Secondary Fallback: Uses the official CoinDCX REST candles endpoint (api.coindcx.com)
-    which returns 250 bars without geoblocks.
+    Multi-Pipe Candle Ingestion:
+    1. Primary: Binance Futures API
+    2. Fallback A: CoinDCX Official REST API with prefixed pair (e.g. 'B-TOKEN_USDT')
+    3. Fallback B: CoinDCX Official REST API with raw/stripped pair (e.g. 'TOKEN_USDT')
     """
-    # 1. Primary Route: Binance Futures
+    # 1. Primary: Binance Futures
     binance_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
     try:
         res = session.get(binance_url, headers=HEADERS, timeout=6)
@@ -170,10 +171,10 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
     except Exception:
         pass
 
-    # 2. Verified Fallback Route: CoinDCX Official REST Candles Endpoint
-    coindcx_url = f"https://api.coindcx.com/market_data/candles?pair={coindcx_pair}&interval={INTERVAL}"
+    # 2. Fallback A: CoinDCX Official API using pair format as discovered
+    coindcx_url_a = f"https://api.coindcx.com/market_data/candles?pair={coindcx_pair}&interval={INTERVAL}"
     try:
-        res = session.get(coindcx_url, headers=HEADERS, timeout=6)
+        res = session.get(coindcx_url_a, headers=HEADERS, timeout=6)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
@@ -183,10 +184,28 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
                     "time": pd.to_numeric(df[time_col], errors="coerce"),
                     "close": pd.to_numeric(df["close"], errors="coerce")
                 }).dropna()
-                # CoinDCX delivers newest candle first; sort chronologically for RMA RSI calculation
                 return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
     except Exception:
         pass
+
+    # 3. Fallback B: CoinDCX Official API using stripped pair format (handles non-B- prefixed assets)
+    stripped_pair = coindcx_pair.split("-", 1)[-1]  # removes 'B-' or 'I-' prefix if present
+    if stripped_pair != coindcx_pair:
+        coindcx_url_b = f"https://api.coindcx.com/market_data/candles?pair={stripped_pair}&interval={INTERVAL}"
+        try:
+            res = session.get(coindcx_url_b, headers=HEADERS, timeout=6)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
+                    df = pd.DataFrame(data)
+                    time_col = "time" if "time" in df.columns else "timestamp"
+                    clean_df = pd.DataFrame({
+                        "time": pd.to_numeric(df[time_col], errors="coerce"),
+                        "close": pd.to_numeric(df["close"], errors="coerce")
+                    }).dropna()
+                    return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
+        except Exception:
+            pass
 
     return None
 
@@ -199,7 +218,7 @@ def process_futures_candle(token_tuple):
 
     clean_df = fetch_candles(binance_sym, coindcx_pair)
     if clean_df is None or len(clean_df) < MIN_CANDLES_REQUIRED:
-        return False
+        return False, binance_sym
 
     clean_df["rsi"] = calculate_wilders_rsi(clean_df["close"], period=RSI_PERIOD)
 
@@ -208,7 +227,7 @@ def process_futures_candle(token_tuple):
     live_price = live_candle["close"]
 
     if pd.isna(current_rsi):
-        return False
+        return False, binance_sym
 
     display_name = format_display_symbol(binance_sym)
 
@@ -221,7 +240,7 @@ def process_futures_candle(token_tuple):
     # Reset state when RSI returns completely to neutral territory
     if RSI_STANDARD_OS < current_rsi < RSI_STANDARD_OB:
         state["last_tier"] = None
-        return True
+        return True, binance_sym
 
     # ----------------- OVERBOUGHT SIGNALS (>= 90.0) ----------------- #
     if current_rsi >= RSI_EXTREME_OB:
@@ -277,20 +296,29 @@ def process_futures_candle(token_tuple):
             state["last_alert_time"] = now
             state["last_tier"] = "STANDARD_OS"
 
-    return True
+    return True, binance_sym
 
 
 def execute_market_sweep(pairs):
+    """
+    Sweeps market concurrently and logs exact tickers that fail ingestion.
+    """
     success_count = 0
+    failed_symbols = []
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_futures_candle, pair) for pair in pairs]
         for future in as_completed(futures):
             try:
-                if future.result():
+                success, symbol = future.result()
+                if success:
                     success_count += 1
+                else:
+                    failed_symbols.append(symbol)
             except Exception:
                 pass
-    return success_count
+
+    return success_count, failed_symbols
 
 
 if __name__ == "__main__":
@@ -310,7 +338,7 @@ if __name__ == "__main__":
 
     while True:
         cycle_start = time.time()
-        success_count = execute_market_sweep(all_pairs)
+        success_count, failed_symbols = execute_market_sweep(all_pairs)
 
         # 6-hour status ping
         if time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL_SECONDS:
@@ -325,5 +353,10 @@ if __name__ == "__main__":
 
         elapsed = time.time() - cycle_start
         print(f"Cycle completed in {elapsed:.2f}s | Successfully ingested: {success_count}/{len(all_pairs)} tokens.", flush=True)
+        
+        # Explicit diagnostic log of the un-ingested tickers
+        if failed_symbols:
+            print(f"Failed Ingestion Tokens ({len(failed_symbols)}): {sorted(failed_symbols)}", flush=True)
+
         sleep_time = max(0, CYCLE_INTERVAL_SECONDS - elapsed)
         time.sleep(sleep_time)
