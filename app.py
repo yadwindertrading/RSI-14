@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import requests
@@ -21,7 +22,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 INTERVAL = "1h"
 RSI_PERIOD = 14
 CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
-MIN_CANDLES_REQUIRED = 20      # Scaled down to 20 bars to support valid newly listed assets
+MIN_CANDLES_REQUIRED = 20      # Supports valid newly listed assets
 
 # Alert Thresholds
 RSI_STANDARD_OB = 90.0
@@ -33,7 +34,7 @@ RSI_EXTREME_OS = 9.0
 COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown reminder for persistent extreme setups
 CYCLE_INTERVAL_SECONDS = 180   # 3-minute full sweep interval (paces requests safely)
 HEARTBEAT_INTERVAL_SECONDS = 6 * 3600  # 6-hour status ping
-MAX_WORKERS = 6                # Concurrency pool size
+MAX_WORKERS = 8                # Concurrency pool size
 # --------------------------------------------------------- #
 
 # Telegram Credentials
@@ -51,13 +52,17 @@ retries = Retry(
     status_forcelist=[429, 500, 502, 503, 504],
     raise_on_status=False
 )
-adapter = HTTPAdapter(max_retries=retries, pool_connections=15, pool_maxsize=15)
+adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
-# Standard browser headers to prevent cloud WAF drops
+# Optional Proxy: Supports routing Binance queries through a proxy if set in Render environment
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+
+# Browser headers to prevent cloud WAF drops
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json"
 }
 
@@ -148,17 +153,32 @@ def format_display_symbol(symbol: str) -> str:
     return symbol
 
 
+def parse_coindcx_candle_response(resp_json):
+    """Parses and chronologically sorts candle lists from CoinDCX API."""
+    if isinstance(resp_json, list) and len(resp_json) >= MIN_CANDLES_REQUIRED:
+        df = pd.DataFrame(resp_json)
+        time_col = "time" if "time" in df.columns else "timestamp"
+        if time_col in df.columns and "close" in df.columns:
+            clean_df = pd.DataFrame({
+                "time": pd.to_numeric(df[time_col], errors="coerce"),
+                "close": pd.to_numeric(df["close"], errors="coerce")
+            }).dropna()
+            return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
+    return None
+
+
 def fetch_candles(binance_sym: str, coindcx_pair: str):
     """
     Multi-Pipe Candle Ingestion:
-    1. Primary: Binance Futures API
-    2. Fallback A: CoinDCX Official REST API with prefixed pair (e.g. 'B-TOKEN_USDT')
-    3. Fallback B: CoinDCX Official REST API with raw/stripped pair (e.g. 'TOKEN_USDT')
+    1. Primary: Binance Futures REST API (with proxy support if configured)
+    2. Fallback A: CoinDCX Official REST API using standard pair identifier
+    3. Fallback B: CoinDCX Spot Bridge for meme multiplier tokens (strips 1000/1000000 prefixes)
+    4. Fallback C: CoinDCX Stripped raw pair (handles non-prefixed assets)
     """
     # 1. Primary: Binance Futures
     binance_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
     try:
-        res = session.get(binance_url, headers=HEADERS, timeout=6)
+        res = session.get(binance_url, headers=HEADERS, timeout=6, proxies=PROXIES)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
@@ -171,39 +191,45 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
     except Exception:
         pass
 
-    # 2. Fallback A: CoinDCX Official API using pair format as discovered
+    # 2. Fallback A: CoinDCX Official REST API with pair identifier
     coindcx_url_a = f"https://api.coindcx.com/market_data/candles?pair={coindcx_pair}&interval={INTERVAL}"
     try:
         res = session.get(coindcx_url_a, headers=HEADERS, timeout=6)
         if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
-                df = pd.DataFrame(data)
-                time_col = "time" if "time" in df.columns else "timestamp"
-                clean_df = pd.DataFrame({
-                    "time": pd.to_numeric(df[time_col], errors="coerce"),
-                    "close": pd.to_numeric(df["close"], errors="coerce")
-                }).dropna()
-                return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
+            parsed = parse_coindcx_candle_response(res.json())
+            if parsed is not None:
+                return parsed
     except Exception:
         pass
 
-    # 3. Fallback B: CoinDCX Official API using stripped pair format (handles non-B- prefixed assets)
-    stripped_pair = coindcx_pair.split("-", 1)[-1]  # removes 'B-' or 'I-' prefix if present
-    if stripped_pair != coindcx_pair:
-        coindcx_url_b = f"https://api.coindcx.com/market_data/candles?pair={stripped_pair}&interval={INTERVAL}"
+    # 3. Fallback B: CoinDCX Meme Token Multiplier Spot Mapping
+    # Resolves 1000PEPE -> PEPE, 1000000MOG -> MOG, 1000SHIB -> SHIB, etc.
+    # Mathematically, RSI of spot token and 1000x futures perpetual are identical.
+    multiplier_match = re.match(r"^(B-|I-)?(1000000|1000)([A-Z0-9]+_USDT)$", coindcx_pair)
+    if multiplier_match:
+        prefix = multiplier_match.group(1) or "B-"
+        underlying = multiplier_match.group(3)
+        spot_pair = f"{prefix}{underlying}"
+        coindcx_url_spot = f"https://api.coindcx.com/market_data/candles?pair={spot_pair}&interval={INTERVAL}"
         try:
-            res = session.get(coindcx_url_b, headers=HEADERS, timeout=6)
+            res = session.get(coindcx_url_spot, headers=HEADERS, timeout=6)
             if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
-                    df = pd.DataFrame(data)
-                    time_col = "time" if "time" in df.columns else "timestamp"
-                    clean_df = pd.DataFrame({
-                        "time": pd.to_numeric(df[time_col], errors="coerce"),
-                        "close": pd.to_numeric(df["close"], errors="coerce")
-                    }).dropna()
-                    return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
+                parsed = parse_coindcx_candle_response(res.json())
+                if parsed is not None:
+                    return parsed
+        except Exception:
+            pass
+
+    # 4. Fallback C: CoinDCX Stripped Raw Pair format
+    stripped_pair = coindcx_pair.split("-", 1)[-1]
+    if stripped_pair != coindcx_pair:
+        coindcx_url_c = f"https://api.coindcx.com/market_data/candles?pair={stripped_pair}&interval={INTERVAL}"
+        try:
+            res = session.get(coindcx_url_c, headers=HEADERS, timeout=6)
+            if res.status_code == 200:
+                parsed = parse_coindcx_candle_response(res.json())
+                if parsed is not None:
+                    return parsed
         except Exception:
             pass
 
@@ -211,7 +237,7 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
 
 
 def process_futures_candle(token_tuple):
-    """Processes live 1-hour candles for a given contract and checks alert conditions."""
+    """Processes live 1-hour candles for a given contract and evaluates RSI alert thresholds."""
     global tracker
     binance_sym, coindcx_pair = token_tuple
     now = time.time()
@@ -250,7 +276,7 @@ def process_futures_candle(token_tuple):
                 f"*Pair:* `{display_name}` (`{binance_sym}`)\n"
                 f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                 f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_EXTREME_OB})\n"
-                f"*Live Futures Price:* `${live_price}`"
+                f"*Live Price:* `${live_price}`"
             )
             send_telegram_alert(msg)
             state["last_alert_time"] = now
@@ -263,7 +289,7 @@ def process_futures_candle(token_tuple):
                 f"*Pair:* `{display_name}` (`{binance_sym}`)\n"
                 f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                 f"*RSI(14):* `{current_rsi:.2f}` (>= {RSI_STANDARD_OB})\n"
-                f"*Live Futures Price:* `${live_price}`"
+                f"*Live Price:* `${live_price}`"
             )
             send_telegram_alert(msg)
             state["last_alert_time"] = now
@@ -277,7 +303,7 @@ def process_futures_candle(token_tuple):
                 f"*Pair:* `{display_name}` (`{binance_sym}`)\n"
                 f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                 f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_EXTREME_OS})\n"
-                f"*Live Futures Price:* `${live_price}`"
+                f"*Live Price:* `${live_price}`"
             )
             send_telegram_alert(msg)
             state["last_alert_time"] = now
@@ -290,7 +316,7 @@ def process_futures_candle(token_tuple):
                 f"*Pair:* `{display_name}` (`{binance_sym}`)\n"
                 f"*Timeframe:* 1 Hour (Live Futures Candle)\n"
                 f"*RSI(14):* `{current_rsi:.2f}` (<= {RSI_STANDARD_OS})\n"
-                f"*Live Futures Price:* `${live_price}`"
+                f"*Live Price:* `${live_price}`"
             )
             send_telegram_alert(msg)
             state["last_alert_time"] = now
