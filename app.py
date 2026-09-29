@@ -21,7 +21,7 @@ threading.Thread(target=run_dummy_server, daemon=True).start()
 # ----------------- SCANNER CONFIGURATION ----------------- #
 INTERVAL = "1h"
 RSI_PERIOD = 14
-CANDLE_LIMIT = 250             # 250 bars ensures full Wilder's RMA mathematical convergence
+CANDLE_LIMIT = 250             # Ensures full Wilder's RMA mathematical convergence
 MIN_CANDLES_REQUIRED = 20      # Supports valid newly listed assets
 
 # Alert Thresholds
@@ -32,7 +32,7 @@ RSI_STANDARD_OS = 12.0
 RSI_EXTREME_OS = 9.0
 
 COOLDOWN_SECONDS = 15 * 60     # 15-minute cooldown reminder for persistent extreme setups
-CYCLE_INTERVAL_SECONDS = 180   # 3-minute full sweep interval (paces requests safely)
+CYCLE_INTERVAL_SECONDS = 180   # 3-minute full sweep interval
 HEARTBEAT_INTERVAL_SECONDS = 6 * 3600  # 6-hour status ping
 MAX_WORKERS = 8                # Concurrency pool size
 # --------------------------------------------------------- #
@@ -153,27 +153,33 @@ def format_display_symbol(symbol: str) -> str:
     return symbol
 
 
-def parse_coindcx_candle_response(resp_json):
-    """Parses and chronologically sorts candle lists from CoinDCX API."""
-    if isinstance(resp_json, list) and len(resp_json) >= MIN_CANDLES_REQUIRED:
-        df = pd.DataFrame(resp_json)
-        time_col = "time" if "time" in df.columns else "timestamp"
-        if time_col in df.columns and "close" in df.columns:
-            clean_df = pd.DataFrame({
-                "time": pd.to_numeric(df[time_col], errors="coerce"),
-                "close": pd.to_numeric(df["close"], errors="coerce")
-            }).dropna()
-            return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
+def parse_coindcx_candlesticks_response(resp_json):
+    """
+    Parses and chronologically sorts candles returned by CoinDCX dedicated futures candlestick gateway:
+    Endpoint structure: {"s": "ok", "data": [{"open": ..., "high": ..., "low": ..., "close": ..., "time": ...}, ...]}
+    """
+    if isinstance(resp_json, dict) and resp_json.get("s") == "ok":
+        data = resp_json.get("data", [])
+        if isinstance(data, list) and len(data) >= MIN_CANDLES_REQUIRED:
+            df = pd.DataFrame(data)
+            time_col = "time" if "time" in df.columns else "timestamp"
+            if time_col in df.columns and "close" in df.columns:
+                clean_df = pd.DataFrame({
+                    "time": pd.to_numeric(df[time_col], errors="coerce"),
+                    "close": pd.to_numeric(df["close"], errors="coerce")
+                }).dropna()
+                return clean_df.drop_duplicates(subset=["time"]).sort_values(by="time", ascending=True).reset_index(drop=True)
     return None
 
 
 def fetch_candles(binance_sym: str, coindcx_pair: str):
     """
     Multi-Pipe Candle Ingestion:
-    1. Primary: Binance Futures REST API (with proxy support if configured)
-    2. Fallback A: CoinDCX Official REST API using standard pair identifier
-    3. Fallback B: CoinDCX Spot Bridge for meme multiplier tokens (strips 1000/1000000 prefixes)
-    4. Fallback C: CoinDCX Stripped raw pair (handles non-prefixed assets)
+    1. Primary: Binance Futures REST API (klines)
+    2. Fallback A: CoinDCX Official Futures Candlesticks Gateway (pcode=f, resolution=60)
+       - Dynamically calculates rolling 250-hour epoch timestamps for complete RSI math convergence
+       - Unblocks commodities (XAU, XAG, COPPER, NATGAS) and non-Binance crypto perpetuals
+    3. Fallback B: CoinDCX Official Futures Candlesticks Gateway without exchange prefix
     """
     # 1. Primary: Binance Futures
     binance_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={INTERVAL}&limit={CANDLE_LIMIT}"
@@ -191,43 +197,34 @@ def fetch_candles(binance_sym: str, coindcx_pair: str):
     except Exception:
         pass
 
-    # 2. Fallback A: CoinDCX Official REST API with pair identifier
-    coindcx_url_a = f"https://api.coindcx.com/market_data/candles?pair={coindcx_pair}&interval={INTERVAL}"
+    # 2. Fallback A: CoinDCX Dedicated Futures Candlestick Gateway (with live rolling time window)
+    now_epoch = int(time.time())
+    from_epoch = now_epoch - (CANDLE_LIMIT * 3600)  # Rolling window covering 250 hours back to present
+
+    coindcx_futures_url = (
+        f"https://public.coindcx.com/market_data/candlesticks"
+        f"?pair={coindcx_pair}&from={from_epoch}&to={now_epoch}&resolution=60&pcode=f"
+    )
     try:
-        res = session.get(coindcx_url_a, headers=HEADERS, timeout=6)
+        res = session.get(coindcx_futures_url, headers=HEADERS, timeout=6)
         if res.status_code == 200:
-            parsed = parse_coindcx_candle_response(res.json())
+            parsed = parse_coindcx_candlesticks_response(res.json())
             if parsed is not None:
                 return parsed
     except Exception:
         pass
 
-    # 3. Fallback B: CoinDCX Meme Token Multiplier Spot Mapping
-    # Resolves 1000PEPE -> PEPE, 1000000MOG -> MOG, 1000SHIB -> SHIB, etc.
-    # Mathematically, RSI of spot token and 1000x futures perpetual are identical.
-    multiplier_match = re.match(r"^(B-|I-)?(1000000|1000)([A-Z0-9]+_USDT)$", coindcx_pair)
-    if multiplier_match:
-        prefix = multiplier_match.group(1) or "B-"
-        underlying = multiplier_match.group(3)
-        spot_pair = f"{prefix}{underlying}"
-        coindcx_url_spot = f"https://api.coindcx.com/market_data/candles?pair={spot_pair}&interval={INTERVAL}"
-        try:
-            res = session.get(coindcx_url_spot, headers=HEADERS, timeout=6)
-            if res.status_code == 200:
-                parsed = parse_coindcx_candle_response(res.json())
-                if parsed is not None:
-                    return parsed
-        except Exception:
-            pass
-
-    # 4. Fallback C: CoinDCX Stripped Raw Pair format
+    # 3. Fallback B: CoinDCX Dedicated Futures Candlestick Gateway (stripped pair format)
     stripped_pair = coindcx_pair.split("-", 1)[-1]
     if stripped_pair != coindcx_pair:
-        coindcx_url_c = f"https://api.coindcx.com/market_data/candles?pair={stripped_pair}&interval={INTERVAL}"
+        coindcx_stripped_url = (
+            f"https://public.coindcx.com/market_data/candlesticks"
+            f"?pair={stripped_pair}&from={from_epoch}&to={now_epoch}&resolution=60&pcode=f"
+        )
         try:
-            res = session.get(coindcx_url_c, headers=HEADERS, timeout=6)
+            res = session.get(coindcx_stripped_url, headers=HEADERS, timeout=6)
             if res.status_code == 200:
-                parsed = parse_coindcx_candle_response(res.json())
+                parsed = parse_coindcx_candlesticks_response(res.json())
                 if parsed is not None:
                     return parsed
         except Exception:
@@ -326,9 +323,7 @@ def process_futures_candle(token_tuple):
 
 
 def execute_market_sweep(pairs):
-    """
-    Sweeps market concurrently and logs exact tickers that fail ingestion.
-    """
+    """Sweeps market concurrently and logs exact tickers that fail ingestion."""
     success_count = 0
     failed_symbols = []
 
@@ -380,7 +375,7 @@ if __name__ == "__main__":
         elapsed = time.time() - cycle_start
         print(f"Cycle completed in {elapsed:.2f}s | Successfully ingested: {success_count}/{len(all_pairs)} tokens.", flush=True)
         
-        # Explicit diagnostic log of the un-ingested tickers
+        # Diagnostic log of un-ingested tickers
         if failed_symbols:
             print(f"Failed Ingestion Tokens ({len(failed_symbols)}): {sorted(failed_symbols)}", flush=True)
 
